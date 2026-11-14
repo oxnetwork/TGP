@@ -451,21 +451,27 @@ def _walk_json_for_uris(obj, found: list):
 
 
 def _try_pantegnos_external(file_bytes: bytes) -> dict:
-    """Optional: call Pantegnos CLI if PANTEGNOS_BIN is set (supports NPVS Gen-2)."""
+    """Call Pantegnos CLI (directory mode: -input / -output). Supports NPVS Gen-2."""
     import os, subprocess, tempfile, shutil
     result = {"success": False, "uris": [], "raw_json": None, "error": None}
+
     candidates = []
     env_bin = os.environ.get("PANTEGNOS_BIN", "").strip()
     if env_bin:
         candidates.append(env_bin)
     for c in ("/data/pantegnos", "/app/pantegnos", "/usr/local/bin/pantegnos", "pantegnos"):
         candidates.append(c)
+
     bin_path = ""
     for c in candidates:
         if not c:
             continue
-        if os.path.sep in c or c.startswith('.'):
-            if os.path.isfile(c) and os.access(c, os.X_OK):
+        if os.path.sep in c or c.startswith("."):
+            if os.path.isfile(c):
+                try:
+                    os.chmod(c, 0o755)
+                except Exception:
+                    pass
                 bin_path = c
                 break
         else:
@@ -473,57 +479,91 @@ def _try_pantegnos_external(file_bytes: bytes) -> dict:
             if found:
                 bin_path = found
                 break
+
     if not bin_path:
-        # one-shot auto install
         try:
-            import subprocess, sys
+            import sys
             target = os.environ.get("PANTEGNOS_BIN") or "/data/pantegnos"
-            script = os.path.join(os.path.dirname(__file__) or ".", "download_pantegnos.py")
-            if os.path.isfile(script):
-                subprocess.run([sys.executable, script, target], timeout=120, check=False)
-                if os.path.isfile(target) and os.access(target, os.X_OK):
-                    bin_path = target
-                    os.environ["PANTEGNOS_BIN"] = target
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_pantegnos.py")
+            if not os.path.isfile(script):
+                script = "download_pantegnos.py"
+            subprocess.run([sys.executable, script, target], timeout=180, check=False)
+            if os.path.isfile(target):
+                try:
+                    os.chmod(target, 0o755)
+                except Exception:
+                    pass
+                bin_path = target
+                os.environ["PANTEGNOS_BIN"] = target
         except Exception as e:
             result["error"] = f"Pantegnos auto-install failed: {e}"
             return result
-    if not bin_path:
+
+    if not bin_path or not os.path.isfile(bin_path):
         result["error"] = "Pantegnos binary not found (set PANTEGNOS_BIN or place at /data/pantegnos)"
         return result
+
     try:
         with tempfile.TemporaryDirectory() as td:
-            inp = os.path.join(td, "in.npvs")
+            in_dir = os.path.join(td, "in")
+            out_dir = os.path.join(td, "out")
+            os.makedirs(in_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
+            inp = os.path.join(in_dir, "sample.npvs")
             with open(inp, "wb") as f:
                 f.write(file_bytes)
-            # Common CLI shapes: pantegnos decrypt <file>  OR  pantegnos <file>
-            cmd_candidates = [
-                [bin_path, "decrypt", inp],
-                [bin_path, inp],
-                [bin_path, "-f", inp],
-            ]
-            out = ""
-            last_err = ""
-            for cmd in cmd_candidates:
-                try:
-                    proc = subprocess.run(cmd, capture_output=True, timeout=30)
-                    out = (proc.stdout or b"").decode("utf-8", errors="ignore")
-                    err = (proc.stderr or b"").decode("utf-8", errors="ignore")
-                    if proc.returncode == 0 and out.strip():
-                        break
-                    last_err = err or out or f"exit {proc.returncode}"
-                except Exception as e:
-                    last_err = str(e)
-            uris = _extract_uris_from_text(out)
+
+            # Official CLI: pantegnos -input <dir> -output <dir>
+            cmd = [bin_path, "-input", in_dir, "-output", out_dir]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=45,
+                    stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired:
+                result["error"] = "Pantegnos timed out (file may need passphrase)"
+                return result
+
+            stdout = (proc.stdout or b"").decode("utf-8", errors="ignore")
+            stderr = (proc.stderr or b"").decode("utf-8", errors="ignore")
+            combined = stdout + "\n" + stderr
+
+            out_text = [combined]
+            for root, _dirs, files in os.walk(out_dir):
+                for name in files:
+                    p = os.path.join(root, name)
+                    try:
+                        out_text.append(open(p, "r", encoding="utf-8", errors="ignore").read())
+                    except Exception:
+                        try:
+                            out_text.append(open(p, "rb").read().decode("utf-8", errors="ignore"))
+                        except Exception:
+                            pass
+
+            blob = "\n".join(out_text)
+            uris = _extract_uris_from_text(blob)
             if uris:
                 result["success"] = True
                 result["uris"] = list(dict.fromkeys(uris))
-                result["raw_json"] = {"source": "pantegnos", "preview": out[:2000]}
+                result["raw_json"] = {"source": "pantegnos", "preview": blob[:2000]}
                 return result
-            result["error"] = f"Pantegnos produced no URIs: {last_err[:300]}"
+
+            err_line = ""
+            for line in combined.splitlines():
+                low = line.lower()
+                if "error" in low or "password" in low or "passphrase" in low or "decrypt" in low:
+                    err_line = line.strip()
+                    break
+            if not err_line:
+                err_line = combined.strip()[-400:] or f"exit={proc.returncode}"
+            result["error"] = f"Pantegnos: {err_line[:400]}"
             return result
     except Exception as e:
-        result["error"] = f"Pantegnos error: {e}"
+        result["error"] = f"Pantegnos failed: {e}"
         return result
+
 
 
 def _decrypt_npvt_legacy_text(raw_content: str) -> dict:
@@ -624,13 +664,13 @@ def decrypt_npvt(file_bytes: bytes) -> dict:
             ext = _try_pantegnos_external(file_bytes)
             if ext.get("success") and ext.get("uris"):
                 return ext
-            if not result.get("error"):
+            if ext.get("error"):
+                result["error"] = ext["error"]
+            elif not result.get("error"):
                 result["error"] = (
                     "NPVS Gen-2 binary detected. Legacy whitebox cannot open it. "
-                    "Set PANTEGNOS_BIN to a Pantegnos CLI binary, or wait for embedded Gen-2 keys."
+                    "Set PANTEGNOS_BIN=/data/pantegnos and ensure CLI works (-input/-output)."
                 )
-            elif ext.get("error") and "not configured" not in ext["error"]:
-                result["error"] = ext["error"]
             elif file_bytes[:4] == b"NPVS":
                 result["error"] = (
                     "NPVS Gen-2 binary: decryption needs Pantegnos/AppKey. "
