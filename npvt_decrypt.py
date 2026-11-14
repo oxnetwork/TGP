@@ -474,6 +474,20 @@ def _try_pantegnos_external(file_bytes: bytes) -> dict:
                 bin_path = found
                 break
     if not bin_path:
+        # one-shot auto install
+        try:
+            import subprocess, sys
+            target = os.environ.get("PANTEGNOS_BIN") or "/data/pantegnos"
+            script = os.path.join(os.path.dirname(__file__) or ".", "download_pantegnos.py")
+            if os.path.isfile(script):
+                subprocess.run([sys.executable, script, target], timeout=120, check=False)
+                if os.path.isfile(target) and os.access(target, os.X_OK):
+                    bin_path = target
+                    os.environ["PANTEGNOS_BIN"] = target
+        except Exception as e:
+            result["error"] = f"Pantegnos auto-install failed: {e}"
+            return result
+    if not bin_path:
         result["error"] = "Pantegnos binary not found (set PANTEGNOS_BIN or place at /data/pantegnos)"
         return result
     try:

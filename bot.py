@@ -31,7 +31,10 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import MessageNotModifiedError, UserAlreadyParticipantError, ChannelPrivateError, SessionPasswordNeededError, FloodWaitError, MessageDeleteForbiddenError
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
+from telethon.tl.types import (
+    MessageEntityTextUrl, MessageEntityUrl,
+    MessageEntityPre, MessageEntityCode, MessageEntityBlockquote,
+)
 from telethon.utils import get_peer_id
 import aiohttp
 from aiohttp import web
@@ -465,10 +468,10 @@ def _refresh_latest_proxies_file():
 
 CUSTOM_FONT_FILE = 'arial.ttf'
 CURRENT_VERSION = "9.12"
-SUPPORTED_PROTOCOLS = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'telegram proxy']
+SUPPORTED_PROTOCOLS = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'wireguard', 'telegram proxy']
 PROTOCOL_NAMES = {
     'vless': 'VLESS', 'vmess': 'VMess', 'trojan': 'Trojan',
-    'ss': 'Shadowsocks', 'hysteria2': 'Hysteria2', 'telegram proxy': 'Telegram Proxy'
+    'ss': 'Shadowsocks', 'hysteria2': 'Hysteria2', 'wireguard': 'WireGuard', 'telegram proxy': 'Telegram Proxy'
 }
 TIMEZONE = pytz.timezone("Asia/Tehran")
 BOT_START_TIME = datetime.now(TIMEZONE)
@@ -518,9 +521,51 @@ def reset_pipeline_stats():
         pipeline_stats[k] = 0
 
 
+def proxy_quota_allow(ltype: str) -> bool:
+    """Ratio gate: after every N configs, allow up to M proxies. Non-proxy always allowed."""
+    if ltype != 'telegram proxy':
+        return True
+    if get_setting('proxy_quota_enabled', '1') != '1':
+        return True
+    try:
+        need_cfg = max(1, int(get_setting('proxy_quota_configs', '8') or 8))
+        max_px = max(0, int(get_setting('proxy_quota_proxies', '3') or 3))
+    except Exception:
+        need_cfg, max_px = 8, 3
+    try:
+        cfg = int(get_setting('proxy_quota_cfg_count', '0') or 0)
+        px = int(get_setting('proxy_quota_px_count', '0') or 0)
+    except Exception:
+        cfg, px = 0, 0
+    # how many proxy slots earned: floor(cfg / need_cfg) * max_px
+    allowed = (cfg // need_cfg) * max_px
+    if px < allowed:
+        return True
+    logging.info(
+        f"⏳ Proxy quota: need more configs first (configs={cfg}, proxies_sent={px}, rule={need_cfg}cfg→{max_px}px)"
+    )
+    return False
+
+
+def proxy_quota_note_sent(ltype: str) -> None:
+    if get_setting('proxy_quota_enabled', '1') != '1':
+        return
+    try:
+        if ltype == 'telegram proxy':
+            n = int(get_setting('proxy_quota_px_count', '0') or 0) + 1
+            set_setting('proxy_quota_px_count', str(n))
+        else:
+            n = int(get_setting('proxy_quota_cfg_count', '0') or 0) + 1
+            set_setting('proxy_quota_cfg_count', str(n))
+            # optional: keep window from exploding — when cfg hits multiple of need, fine
+    except Exception:
+        pass
+
+
+
 # --- عبارات باقاعده (Regex) ---
-V2RAY_REGEX = r'((?:vless|vmess|trojan|ss|hysteria2)://[a-zA-Z0-9\-\._~:/\?#\[\]@!$&\'\(\)\*\+,;=%]+)'
-PROXY_REGEX = r'(https?://t\.me/(?:proxy|s)\?[a-zA-Z0-9\-\._~=&]+)'
+V2RAY_REGEX = r'((?:vless|vmess|trojan|ss|hysteria2|hy2|wireguard)://[a-zA-Z0-9\-\._~:/\?#\[\]@!$&\'\(\)\*\+,;=%]+)'
+PROXY_REGEX = r'(https?://t\.me/(?:proxy|socks|s|webproxy)\?[a-zA-Z0-9\-\._~=&%]+)'
 
 # =================================================================================
 # Localization (Multi-Language Support)
@@ -762,6 +807,11 @@ def db_init():
         'mahsa_exclude_protocols': '',
         'nimbaha_enabled': '1',
         'proxy_domain_to_ip': '1',
+        'proxy_quota_enabled': '1',
+        'proxy_quota_configs': '8',
+        'proxy_quota_proxies': '3',
+        'proxy_quota_cfg_count': '0',
+        'proxy_quota_px_count': '0',
         'github_enabled': '0',
         'github_token': os.environ.get('GITHUB_TOKEN', ''),
         'github_owner': os.environ.get('GITHUB_OWNER', ''),
@@ -1010,7 +1060,7 @@ async def test_config_connectivity(ip, port, timeout=2, link: str = None, link_t
     Returns (is_online, ping_ms). -1 fail, -2 skipped.
     """
     async with test_semaphore:
-        if link_type == 'telegram proxy' or (link and ('t.me/proxy' in str(link) or 't.me/s?' in str(link))):
+        if link_type == 'telegram proxy' or (link and ('t.me/proxy' in str(link) or 't.me/socks' in str(link) or 't.me/s?' in str(link) or 't.me/webproxy' in str(link))):
             return await test_telegram_proxy(ip, port, link=link, timeout=max(timeout, 4))
 
         method = get_setting('connectivity_test_method', 'tcp')
@@ -1063,10 +1113,30 @@ def parse_config(link):
                 return None, None, "unknown", None
             identifier = f"{uid}@{host}"
             return host, port, scheme, identifier
-        elif link.startswith("hysteria2://"):
+        elif link.startswith("hysteria2://") or link.startswith("hy2://"):
+            if link.startswith("hy2://"):
+                link = "hysteria2://" + link[6:]
             parsed_url = urlparse(link)
-            identifier = f"{parsed_url.hostname}:{parsed_url.port}"
-            return parsed_url.hostname, parsed_url.port, "hysteria2", identifier
+            host = parsed_url.hostname
+            port = parsed_url.port or 443
+            uid = (parsed_url.username or "").strip()
+            if not host:
+                return None, None, "unknown", None
+            identifier = f"{uid}@{host}" if uid else f"{host}:{port}"
+            return host, port, "hysteria2", identifier
+        elif link.startswith("wireguard://"):
+            parsed_url = urlparse(link)
+            host = parsed_url.hostname
+            port = parsed_url.port or 51820
+            # private key is username part
+            priv = (parsed_url.username or "").strip()
+            if not host:
+                return None, None, "unknown", None
+            # dedupe by publickey if present else host:port
+            qs = parse_qs(parsed_url.query)
+            pub = (qs.get("publickey") or qs.get("publicKey") or [""])[0]
+            identifier = f"{pub}@{host}" if pub else (f"{priv[:16]}@{host}" if priv else f"{host}:{port}")
+            return host, int(port), "wireguard", identifier
         elif link.startswith("ss://"):
             if '@' in link:
                 main_part = link.split('@')[1]
@@ -1084,11 +1154,24 @@ def parse_config(link):
             identifier = f"{host}:{port}"
             return host, port, "ss", identifier
 
-        elif "t.me/proxy" in link or "t.me/s" in link:
+        elif "t.me/proxy" in link or "t.me/socks" in link or "t.me/s?" in link or "t.me/webproxy" in link:
             query = parse_qs(urlparse(link).query)
             server = query.get("server", [None])[0]
-            port = int(query.get("port", [0])[0])
-            return server, port, "telegram proxy", server
+            # webproxy often encodes path in server=host/path and omits port
+            if server and ("%2F" in server or "/" in server):
+                from urllib.parse import unquote
+                server_raw = unquote(server)
+                # host is before first /
+                host_only = server_raw.split("/")[0]
+            else:
+                host_only = server
+            try:
+                port = int(query.get("port", [0])[0] or 0)
+            except Exception:
+                port = 0
+            if port <= 0:
+                port = 443 if "webproxy" in link else 443
+            return host_only or server, port, "telegram proxy", host_only or server
     except Exception as e:
         logging.warning(f"⚠️ [PARSE ERROR] {link[:30]}... | {e}")
     return None, None, "unknown", None
@@ -1113,7 +1196,7 @@ async def resolve_host_to_ipv4(host: str):
 
 
 def rewrite_tg_proxy_server(link: str, new_server: str) -> str:
-    """Replace server= in t.me/proxy or t.me/socks link with IP."""
+    """Replace server= in t.me/proxy|socks|webproxy link with IP."""
     try:
         p = urlparse(link)
         qs = parse_qs(p.query, keep_blank_values=True)
@@ -1260,6 +1343,28 @@ def is_client_importable(link: str, link_type: str = "") -> tuple:
             body = link.split("#", 1)[0]
             if "@" not in body:
                 return False, "trojan no host"
+            return True, ""
+        if link.startswith("hysteria2://") or link.startswith("hy2://") or lt in ("hysteria2", "hy2"):
+            body = link.split("#", 1)[0]
+            if "://" not in body:
+                return False, "hy2 bad"
+            try:
+                pu = urlparse(body if body.startswith("hysteria") else "hysteria2://" + body.split("://",1)[-1])
+            except Exception:
+                return False, "hy2 bad url"
+            if not pu.hostname:
+                return False, "hy2 empty host"
+            return True, ""
+        if link.startswith("wireguard://") or lt == "wireguard":
+            body = link.split("#", 1)[0]
+            try:
+                pu = urlparse(body)
+            except Exception:
+                return False, "wg bad url"
+            if not pu.hostname:
+                return False, "wg empty host"
+            if not (pu.username or "").strip():
+                return False, "wg missing private key"
             return True, ""
         return True, ""
     except Exception as e:
@@ -1484,44 +1589,71 @@ async def extract_links_from_message(message):
         except Exception:
             pass
 
+
     text_to_scan = _normalize_config_text("\n".join(parts))
-    # primary regex + robust extractor (handles code fences / base64 lines)
+    # Expand Telegram mono/code markdown leftovers
+    text_to_scan = text_to_scan.replace("```", "\n").replace("`", " ")
     links.update(re.findall(V2RAY_REGEX, text_to_scan))
     links.update(re.findall(PROXY_REGEX, text_to_scan))
     try:
         links.update(extract_configs_from_text(text_to_scan))
     except Exception:
         pass
-    # looser fallback: any scheme:// until whitespace
     for m in re.finditer(
-        r'(?i)\b((?:vless|vmess|trojan|ss|hysteria2|hy2)://[^\s`\'"<>]+)',
+        r'(?i)\b((?:vless|vmess|trojan|ss|hysteria2|hy2|wireguard)://[^\s`\'"<>]+)',
         text_to_scan,
     ):
         links.add(m.group(1).rstrip('`.,;)]}»"\''))
+
+    def _slice_entity(msg, ent):
+        base = msg.raw_text or msg.text or getattr(msg, "message", None) or ""
+        try:
+            return base[ent.offset: ent.offset + ent.length]
+        except Exception:
+            return ""
 
     if getattr(message, "entities", None):
         for entity in message.entities:
             try:
                 url = ""
+                chunk = ""
                 if isinstance(entity, MessageEntityTextUrl):
                     url = entity.url or ""
+                    chunk = _slice_entity(message, entity)
                 elif isinstance(entity, MessageEntityUrl):
-                    base = message.text or message.raw_text or ""
-                    url = base[entity.offset:entity.offset + entity.length]
-                url = _normalize_config_text(url)
-                if url and (
-                    any(url.startswith(p) for p in ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://"))
-                    or "t.me/proxy" in url
-                    or "t.me/s?" in url
-                ):
-                    links.add(url)
+                    url = _slice_entity(message, entity)
+                    chunk = url
+                elif isinstance(entity, (MessageEntityPre, MessageEntityCode, MessageEntityBlockquote)):
+                    chunk = _slice_entity(message, entity)
+                else:
+                    name = type(entity).__name__
+                    if any(k in name for k in ("Quote", "Pre", "Code", "Blockquote")):
+                        chunk = _slice_entity(message, entity)
+
+                for piece in (url, chunk):
+                    piece = _normalize_config_text(piece or "")
+                    if not piece:
+                        continue
+                    piece = piece.replace("```", "\n").replace("`", " ")
+                    for m in re.finditer(
+                        r'(?i)\b((?:vless|vmess|trojan|ss|hysteria2|hy2|wireguard)://[^\s`\'"<>]+)',
+                        piece,
+                    ):
+                        links.add(m.group(1).rstrip('`.,;)]}»"\''))
+                    links.update(re.findall(V2RAY_REGEX, piece))
+                    links.update(re.findall(PROXY_REGEX, piece))
+                    if any(piece.startswith(p) for p in (
+                        "vless://", "vmess://", "trojan://", "ss://",
+                        "hysteria2://", "hy2://", "wireguard://",
+                    )):
+                        links.add(piece.split()[0].rstrip('`.,;)]}»"\''))
             except (TypeError, IndexError, Exception):
                 continue
-    # normalize hy2 → hysteria2 for downstream
     out = []
     for u in links:
         if not u:
             continue
+        u = u.strip()
         if u.lower().startswith("hy2://"):
             u = "hysteria2://" + u[6:]
         out.append(u)
@@ -4168,6 +4300,11 @@ async def process_single_link(link, source_id):
         is_online, ping = False, -1
         skip_test = False
 
+        # Proxy share quota (e.g. 8 configs → 3 proxies)
+        if ltype == 'telegram proxy' and not proxy_quota_allow(ltype):
+            bump_pipeline('other_skip')
+            return None
+
         # Telegram proxies use a SEPARATE test path (never Xray)
         if ltype == 'telegram proxy':
             is_online, ping = await test_telegram_proxy(ip, port, link=link, timeout=4)
@@ -4341,6 +4478,7 @@ async def process_single_link(link, source_id):
                 except Exception:
                     pass
 
+            proxy_quota_note_sent(ltype)
             bump_pipeline('sent')
             logging.info(f"✅ Forwarded '{ltype}' from {get_source_label(source_id)} | Location: {loc.get('country_code')}")
 
