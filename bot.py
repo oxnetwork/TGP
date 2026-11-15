@@ -511,7 +511,19 @@ def _refresh_latest_proxies_file():
 
 
 CUSTOM_FONT_FILE = 'arial.ttf'
-CURRENT_VERSION = "9.13"
+CURRENT_VERSION = "9.15"
+
+def _short_sha(sha, n=7):
+    """Short git SHA for UI (e.g. 3cfb07f)."""
+    try:
+        s = (sha or "").strip()
+        if not s or s == "-":
+            return "—"
+        return s[: int(n)]
+    except Exception:
+        return "—"
+
+
 SUPPORTED_PROTOCOLS = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'wireguard', 'telegram proxy']
 PROTOCOL_NAMES = {
     'vless': 'VLESS', 'vmess': 'VMess', 'trojan': 'Trojan',
