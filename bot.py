@@ -2277,20 +2277,29 @@ def register_bot_handlers():
             set_setting("auto_pending_sha", remote_sha)
             set_setting("auto_pending_msg", info.get("message") or "")
             updated = (not local_sha) or (local_sha != remote_sha)
+            short_r = _short_sha(remote_sha)
+            short_l = _short_sha(local_sha)
+            status_line = (
+                f"✅ نسخه جدید روی GitHub است: `{short_r}`"
+                if updated else
+                f"ℹ️ همین الان آخرین نسخه است: `{short_r}`"
+            )
             text = (
                 "🔍 **نتیجه چک آپدیت**" + chr(10) + chr(10)
-                + f"ریپو: `{owner}/{repo}` @ `{branch}`" + chr(10)
-                + f"🏷 آخرین نسخه GitHub: `{_short_sha(remote_sha)}`" + chr(10)
-                + f"📦 نسخه فعلی ذخیره‌شده: `{_short_sha(local_sha)}`" + chr(10)
-                + f"Remote SHA: `{remote_sha[:12] if remote_sha else '—'}`" + chr(10)
-                + f"پیام: {info.get('message') or '—'}" + chr(10)
-                + f"تاریخ: {info.get('date') or '—'}" + chr(10) + chr(10)
-                + ("✅ نسخه جدید روی گیت‌هاب هست." if updated else "ℹ️ همان نسخه قبلی است.")
+                + f"ریپو: `{owner}/{repo}` @ `{branch}`" + chr(10) + chr(10)
+                + f"🏷 **آخرین نسخه:** `{short_r}`" + chr(10)
+                + f"📦 نسخه ثبت‌شده در ربات: `{short_l}`" + chr(10)
+                + f"🔗 SHA: `{remote_sha[:12] if remote_sha else '—'}`" + chr(10)
+                + f"💬 {info.get('message') or '—'}" + chr(10)
+                + f"📅 {info.get('date') or '—'}" + chr(10) + chr(10)
+                + status_line
             )
             buttons = []
             if updated:
                 buttons.append([Button.inline("✅ تأیید آپدیت (Railway Redeploy)", "au_confirm_update")])
                 buttons.append([Button.inline("❌ لغو", "au_cancel_update")])
+            else:
+                buttons.append([Button.inline("♻️ Redeploy همین نسخه روی Railway", "au_confirm_update")])
             buttons.append([Button.inline("🔙 بازگشت", "auto_update_menu")])
             await event.respond(text, buttons=buttons)
             return
