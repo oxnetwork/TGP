@@ -66,11 +66,15 @@ def _norm_network(net: str) -> str:
     net = (net or "tcp").lower().strip()
     if net in ("websocket",):
         return "ws"
-    # map newer aliases to closest supported stream
-    if net in ("xhttp", "httpupgrade", "http"):
-        return "ws" if net != "http" else "tcp"
+    if net in ("splithttp",):
+        return "xhttp"
+    if net in ("httpupgrade",):
+        return "httpupgrade"
+    if net in ("http",):
+        return "tcp"
     if net in ("h2", "http2"):
         return "h2"
+    # keep xhttp as-is for modern Xray cores
     return net
 
 
@@ -182,6 +186,30 @@ def _vless_to_outbound(link: str) -> Optional[dict]:
             "serviceName": q.get("serviceName") or q.get("path") or "",
             "multiMode": q.get("mode") == "multi",
         }
+    if network in ("xhttp", "splithttp"):
+        stream["network"] = "xhttp"
+        xhs = {
+            "path": q.get("path") or "/",
+            "host": q.get("host") or q.get("sni") or host,
+            "mode": q.get("mode") or "auto",
+        }
+        # optional extra JSON (padding / obfs flags from clients)
+        extra_raw = (q.get("extra") or "").strip()
+        if extra_raw:
+            try:
+                import json as _json
+                extra_obj = _json.loads(extra_raw)
+                if isinstance(extra_obj, dict):
+                    xhs.update(extra_obj)
+            except Exception:
+                pass
+        stream["xhttpSettings"] = xhs
+    if network == "httpupgrade":
+        stream["network"] = "httpupgrade"
+        stream["httpupgradeSettings"] = {
+            "path": q.get("path") or "/",
+            "host": q.get("host") or q.get("sni") or host,
+        }
     if network == "tcp":
         header_type = (q.get("headerType") or "none").lower()
         if header_type and header_type not in ("none", ""):
@@ -215,7 +243,12 @@ def _vless_to_outbound(link: str) -> Optional[dict]:
             "spiderX": q.get("spx") or "",
         }
 
-    user = {"id": uuid, "encryption": q.get("encryption") or "none"}
+    enc = (q.get("encryption") or "none").strip()
+    # Post-quantum / experimental encryption values may break older cores during test
+    if enc and enc.lower() not in ("none", "zero"):
+        if any(x in enc.lower() for x in ("mlkem", "kyber", "x25519plus", "native")):
+            enc = "none"
+    user = {"id": uuid, "encryption": enc or "none"}
     flow = (q.get("flow") or "").strip()
     if flow:
         user["flow"] = flow

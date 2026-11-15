@@ -88,6 +88,13 @@ except Exception:
     GITHUB_SYNC_AVAILABLE = False
 
 try:
+    import auto_update
+    AUTO_UPDATE_AVAILABLE = True
+except Exception:
+    AUTO_UPDATE_AVAILABLE = False
+    auto_update = None
+
+try:
     from npvt_decrypt import decrypt_npvt
     NPVT_AVAILABLE = True
 except Exception:
@@ -452,6 +459,43 @@ def _refresh_latest_configs_file():
     return n
 
 
+
+def _rebuild_subscription_pool_from_db(limit: int = None) -> int:
+    """Restore in-memory subscription FIFO from successful_configs so latest_configs.txt survives restarts."""
+    global hourly_txt_backup_configs
+    try:
+        lim = int(limit if limit is not None else get_setting("sub_max_configs", str(SUB_MAX_CONFIGS)) or SUB_MAX_CONFIGS)
+    except Exception:
+        lim = SUB_MAX_CONFIGS or 100
+    lim = max(10, min(lim, 500))
+    rows = []
+    try:
+        rows = db_execute(
+            "SELECT link, timestamp FROM successful_configs ORDER BY id DESC LIMIT ?",
+            (lim,),
+            fetch="all",
+        ) or []
+    except Exception as e:
+        logging.warning(f"rebuild sub pool: {e}")
+        return 0
+    # oldest first for FIFO
+    items = []
+    seen = set()
+    for link, ts in reversed(rows):
+        if not link or link in seen:
+            continue
+        seen.add(link)
+        iso = ts if isinstance(ts, str) and ts else datetime.now(TIMEZONE).isoformat()
+        items.append((iso, link))
+    hourly_txt_backup_configs = items[-lim:]
+    try:
+        n = _refresh_latest_configs_file()
+    except Exception as e:
+        logging.warning(f"refresh after rebuild: {e}")
+        n = len(hourly_txt_backup_configs)
+    logging.info(f"♻️ Subscription pool restored from DB: {len(hourly_txt_backup_configs)} links (file={n})")
+    return len(hourly_txt_backup_configs)
+
 def _refresh_latest_proxies_file():
     global hourly_txt_backup_proxies
     hourly_txt_backup_proxies = _prune_sub_window(hourly_txt_backup_proxies)
@@ -467,7 +511,7 @@ def _refresh_latest_proxies_file():
 
 
 CUSTOM_FONT_FILE = 'arial.ttf'
-CURRENT_VERSION = "9.12"
+CURRENT_VERSION = "9.13"
 SUPPORTED_PROTOCOLS = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'wireguard', 'telegram proxy']
 PROTOCOL_NAMES = {
     'vless': 'VLESS', 'vmess': 'VMess', 'trojan': 'Trojan',
@@ -564,7 +608,7 @@ def proxy_quota_note_sent(ltype: str) -> None:
 
 
 # --- عبارات باقاعده (Regex) ---
-V2RAY_REGEX = r'((?:vless|vmess|trojan|ss|hysteria2|hy2|wireguard)://[a-zA-Z0-9\-\._~:/\?#\[\]@!$&\'\(\)\*\+,;=%]+)'
+V2RAY_REGEX = r'((?:vless|vmess|trojan|ss|hysteria2|hy2|wireguard)://[^\s<>"\'`]+)'
 PROXY_REGEX = r'(https?://t\.me/(?:proxy|socks|s|webproxy)\?[a-zA-Z0-9\-\._~=&%]+)'
 
 # =================================================================================
@@ -1071,7 +1115,12 @@ async def test_config_connectivity(ip, port, timeout=2, link: str = None, link_t
                     ok, ping = await test_with_xray(link, timeout=max(float(timeout), 8.0))
                     if ok:
                         return True, ping
-                    # Xray ran but tunnel failed — treat as offline (do NOT soft-pass via TCP)
+                    # Modern transports (xhttp/splithttp/httpupgrade) often fail Xray test
+                    # on limited cores — fall back to TCP so valid shares are not dropped.
+                    low = str(link).lower()
+                    if any(t in low for t in ('type=xhttp', 'type=splithttp', 'type=httpupgrade', 'type=h2', 'network=xhttp')):
+                        logging.info("xhttp/special transport: Xray fail → TCP fallback")
+                        return await _tcp_ping(ip, port, timeout=timeout)
                     return False, -1
                 except Exception as e:
                     logging.warning(f"⚠️ Xray test error, falling back to TCP: {e}")
@@ -1336,8 +1385,9 @@ def is_client_importable(link: str, link_type: str = "") -> tuple:
                     return False, "reality missing pbk"
                 if not qs.get("sni") and not qs.get("host"):
                     return False, "reality missing sni/host"
-            if re.search(r"(?:[?&])(?:fp|sni|pbk|sid|host|path|alpn)(?:&|$)", body):
+            if re.search(r"(?:[?&])(?:fp|sni|pbk|sid|host|path|alpn)=(?:&|$)", body):
                 return False, "empty query param"
+            # xhttp / httpupgrade / splithttp / extra JSON are valid modern vless
             return True, ""
         if link.startswith("trojan://") or lt == "trojan":
             body = link.split("#", 1)[0]
@@ -1858,7 +1908,7 @@ def register_bot_handlers():
             await edit_panel(get_sender_menu_layout)
             return
 
-        if data in ('set_sub_max_configs', 'set_sub_meta_add', 'set_mahsa_ads', 'set_github_token', 'set_github_owner', 'set_github_repo', 'set_github_interval', 'set_github_hours', 'set_mahsa_exclude_countries', 'set_mahsa_exclude_protocols', 'add_source', 'add_sub_source', 'add_source_bulk', 'set_footer', 'set_naming_template', 'set_sleep_time', 'set_target', 'config_tester', 'set_slow_mode_delay', 'set_send_min_interval', 'set_prune_threshold', 'set_country_filter_list', 'set_isp_filter_list', 'set_dedupe_time', 'set_ping_filter', 'import_full_backup', 'manual_process', 'set_live_stats_interval', 'add_txt_source', 'set_dedupe_exception_list', 'set_connectivity_exception_list', 'npvt_admin_test', 'userbot_set_token', 'userbot_add_admin', 'userbot_set_webhook'):
+        if data in ('set_sub_max_configs', 'set_sub_meta_add', 'set_mahsa_ads', 'set_github_token', 'set_github_owner', 'set_github_repo', 'set_github_interval', 'set_github_hours', 'set_mahsa_exclude_countries', 'set_mahsa_exclude_protocols', 'add_source', 'add_sub_source', 'add_source_bulk', 'set_footer', 'set_naming_template', 'set_sleep_time', 'set_target', 'config_tester', 'set_slow_mode_delay', 'set_send_min_interval', 'set_prune_threshold', 'set_country_filter_list', 'set_isp_filter_list', 'set_dedupe_time', 'set_ping_filter', 'import_full_backup', 'manual_process', 'set_live_stats_interval', 'add_txt_source', 'set_dedupe_exception_list', 'set_connectivity_exception_list', 'npvt_admin_test', 'userbot_set_token', 'userbot_add_admin', 'userbot_set_webhook', 'au_set_gh_token', 'au_set_rw_token', 'au_set_gh_owner', 'au_set_gh_repo', 'au_set_gh_branch', 'au_set_rw_service', 'au_set_rw_env', 'au_upload_zip'):
             await handle_conversation(event, data)
             return
 
@@ -2190,6 +2240,107 @@ def register_bot_handlers():
             return
 
 
+        
+        if data == "auto_update_menu":
+            return await edit_panel(get_auto_update_menu_layout)
+
+        if data == "au_rebuild_sub":
+            try:
+                n = _rebuild_subscription_pool_from_db()
+                await event.answer(f"بازسازی شد: {n} لینک", alert=True)
+            except Exception as e:
+                await event.answer(f"خطا: {e}", alert=True)
+            return await edit_panel(get_auto_update_menu_layout)
+
+        if data == "au_check_update":
+            if not AUTO_UPDATE_AVAILABLE:
+                await event.answer("ماژول auto_update نیست", alert=True)
+                return
+            token = get_setting("auto_gh_token", "") or get_setting("github_token", "") or os.environ.get("GITHUB_TOKEN", "")
+            owner = get_setting("auto_gh_owner", "") or get_setting("github_owner", "") or os.environ.get("GITHUB_OWNER", "")
+            repo = get_setting("auto_gh_repo", "") or get_setting("github_repo", "") or os.environ.get("GITHUB_REPO", "")
+            branch = get_setting("auto_gh_branch", "main") or "main"
+            if not token or not owner or not repo:
+                await event.answer("توکن/Owner/Repo را تنظیم کن", alert=True)
+                return await edit_panel(get_auto_update_menu_layout)
+            try:
+                await event.answer("در حال چک…")
+            except Exception:
+                pass
+            ok, info = await asyncio.to_thread(auto_update.github_latest_commit, token, owner, repo, branch)
+            set_setting("auto_last_check", _iran_now_str())
+            if not ok:
+                await event.respond(f"❌ چک آپدیت ناموفق:\n`{info.get('error')}`")
+                return await edit_panel(get_auto_update_menu_layout)
+            remote_sha = info.get("sha") or ""
+            local_sha = get_setting("auto_last_sha", "") or ""
+            set_setting("auto_pending_sha", remote_sha)
+            set_setting("auto_pending_msg", info.get("message") or "")
+            updated = (not local_sha) or (local_sha != remote_sha)
+            text = (
+                "🔍 **نتیجه چک آپدیت**" + chr(10) + chr(10)
+                + f"ریپو: `{owner}/{repo}` @ `{branch}`" + chr(10)
+                + f"Remote SHA: `{remote_sha[:12]}`" + chr(10)
+                + f"Local SHA: `{(local_sha[:12] if local_sha else '—')}`" + chr(10)
+                + f"پیام: {info.get('message') or '—'}" + chr(10)
+                + f"تاریخ: {info.get('date') or '—'}" + chr(10) + chr(10)
+                + ("✅ نسخه جدید روی گیت‌هاب هست." if updated else "ℹ️ همان نسخه قبلی است.")
+            )
+            buttons = []
+            if updated:
+                buttons.append([Button.inline("✅ تأیید آپدیت (Railway Redeploy)", "au_confirm_update")])
+                buttons.append([Button.inline("❌ لغو", "au_cancel_update")])
+            buttons.append([Button.inline("🔙 بازگشت", "auto_update_menu")])
+            await event.respond(text, buttons=buttons)
+            return
+
+        if data == "au_cancel_update":
+            set_setting("auto_pending_sha", "")
+            await event.answer("لغو شد", alert=True)
+            return await edit_panel(get_auto_update_menu_layout)
+
+        if data == "au_confirm_update":
+            if not AUTO_UPDATE_AVAILABLE:
+                await event.answer("ماژول نیست", alert=True)
+                return
+            rw = get_setting("auto_rw_token", "") or os.environ.get("RAILWAY_TOKEN", "")
+            svc = get_setting("auto_rw_service", "") or os.environ.get("RAILWAY_SERVICE_ID", "")
+            env = get_setting("auto_rw_env", "") or os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+            pending = get_setting("auto_pending_sha", "")
+            if not rw or not svc:
+                await event.respond(
+                    "⚠️ Railway Token یا Service ID تنظیم نیست.\n"
+                    "اگر ریپو به Railway وصل است، با push قبلی دیپلوی خودکار می‌شود.\n"
+                    "SHA به‌عنوان اعمال‌شده ذخیره می‌شود."
+                )
+                if pending:
+                    set_setting("auto_last_sha", pending)
+                return await edit_panel(get_auto_update_menu_layout)
+            try:
+                await event.answer("در حال Redeploy…")
+            except Exception:
+                pass
+            ok, info = await asyncio.to_thread(auto_update.railway_redeploy, rw, svc, env)
+            if ok:
+                if pending:
+                    set_setting("auto_last_sha", pending)
+                ok2, sinfo = await asyncio.to_thread(auto_update.railway_service_info, rw, svc)
+                extra = ""
+                if ok2:
+                    deps = sinfo.get("deployments") or []
+                    if deps:
+                        d0 = deps[0]
+                        extra = f"\nآخرین دیپلوی: `{d0.get('status')}` · `{d0.get('createdAt')}`"
+                await event.respond(
+                    f"✅ درخواست آپدیت Railway ثبت شد.\nmethod=`{info.get('method')}`{extra}\n"
+                    f"SHA: `{(pending[:12] if pending else '—')}`\n"
+                    "بعد از بالا آمدن سرویس، `latest_configs.txt` از دیتابیس بازسازی می‌شود."
+                )
+            else:
+                await event.respond(f"❌ Redeploy ناموفق:\n`{info.get('error') or info}`")
+            return await edit_panel(get_auto_update_menu_layout)
+
+
         if data in ("dl_log_1h", "dl_log_full"):
             try:
                 await event.answer("در حال آماده‌سازی فایل لاگ…")
@@ -2307,8 +2458,48 @@ async def get_system_menu_layout():
                [Button.inline("🧪 تست کانفیگ", "config_tester"), Button.inline(get_text('button_manual_process', 'fa'), "manual_process")],
                [Button.inline("🔑 مدیریت نشست", "session_management"), Button.inline("♻️ ریستارت ربات", "ask_restart_bot")],
                [Button.inline("🤖 ربات سوم (کاربری)", "userbot_panel")],
+               [Button.inline("🚀 آپدیت خودکار", "auto_update_menu")],
                [Button.inline(get_text('button_back_main', 'fa'), "main_menu")]]
     return text, buttons
+
+
+async def get_auto_update_menu_layout():
+    gh_tok = bool(get_setting("auto_gh_token", "") or os.environ.get("GITHUB_TOKEN") or get_setting("github_token", ""))
+    gh_owner = get_setting("auto_gh_owner", "") or get_setting("github_owner", "") or os.environ.get("GITHUB_OWNER", "")
+    gh_repo = get_setting("auto_gh_repo", "") or get_setting("github_repo", "") or os.environ.get("GITHUB_REPO", "")
+    gh_branch = get_setting("auto_gh_branch", "main") or "main"
+    rw_tok = bool(get_setting("auto_rw_token", "") or os.environ.get("RAILWAY_TOKEN", ""))
+    rw_svc = get_setting("auto_rw_service", "") or os.environ.get("RAILWAY_SERVICE_ID", "")
+    rw_env = get_setting("auto_rw_env", "") or os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+    last_sha = get_setting("auto_last_sha", "") or "-"
+    last_check = get_setting("auto_last_check", "") or "-"
+    avail = "🟢" if AUTO_UPDATE_AVAILABLE else "🔴 ماژول نیست"
+    text = (
+        "🚀 **آپدیت خودکار**" + chr(10) + chr(10)
+        + f"ماژول: {avail}" + chr(10)
+        + f"نسخه فعلی ربات: `{CURRENT_VERSION}`" + chr(10) + chr(10)
+        + "🐙 **GitHub**" + chr(10)
+        + f"🔑 توکن: {'✅' if gh_tok else '❌'}" + chr(10)
+        + f"📁 `{gh_owner or '—'} / {gh_repo or '—'}`  branch=`{gh_branch}`" + chr(10) + chr(10)
+        + "🚂 **Railway**" + chr(10)
+        + f"🔑 توکن: {'✅' if rw_tok else '❌'}" + chr(10)
+        + f"🆔 Service: `{rw_svc or '—'}`" + chr(10)
+        + f"🌐 Env: `{rw_env or '—'}`" + chr(10) + chr(10)
+        + f"آخرین SHA ذخیره‌شده: `{last_sha[:12]}`" + chr(10)
+        + f"آخرین چک: {last_check}"
+    )
+    buttons = [
+        [Button.inline("🔑 GH Token", "au_set_gh_token"), Button.inline("🔑 RW Token", "au_set_rw_token")],
+        [Button.inline("👤 Owner", "au_set_gh_owner"), Button.inline("📁 Repo", "au_set_gh_repo")],
+        [Button.inline("🌿 Branch", "au_set_gh_branch")],
+        [Button.inline("🆔 Service ID", "au_set_rw_service"), Button.inline("🌐 Env ID", "au_set_rw_env")],
+        [Button.inline("📦 آپلود سورس (ZIP)", "au_upload_zip")],
+        [Button.inline("🔍 چک آپدیت", "au_check_update")],
+        [Button.inline("♻️ Rebuild latest_configs", "au_rebuild_sub")],
+        [Button.inline("🔙 بازگشت", "system_menu")],
+    ]
+    return text, buttons
+
 
 async def get_session_menu_layout():
     try:
@@ -3303,6 +3494,15 @@ async def get_source_stats_layout():
 async def handle_conversation(event, conv_type):
     global manual_process_sent_counter
     prompts = {
+
+        'au_set_gh_token': 'توکن GitHub (PAT با scope: repo) را بفرست. برای پاک کردن: خالی',
+        'au_set_rw_token': 'توکن Railway را بفرست. برای پاک کردن: خالی',
+        'au_set_gh_owner': 'GitHub Owner را بفرست (مثال: PlanAslii)',
+        'au_set_gh_repo': 'نام ریپو را بفرست (مثال: meiton)',
+        'au_set_gh_branch': 'نام برنچ را بفرست (مثال: main)',
+        'au_set_rw_service': 'Railway Service ID را بفرست',
+        'au_set_rw_env': 'Railway Environment ID را بفرست (اختیاری)',
+        'au_upload_zip': 'فایل ZIP سورس را ارسال کن',
         'add_source': "لطفا یوزرنیم، لینک یا یک پیام فوروارد شده از کانال منبع متنی را ارسال کنید.",
         'add_sub_source': "لینک سابسکریپشن را بفرستید (مثال: https://raw.githubusercontent.com/.../all.txt).",
         'add_txt_source': "لطفا یوزرنیم، لینک یا یک پیام فوروارد شده از کانال منبع فایل TXT را ارسال کنید.",
@@ -3561,6 +3761,89 @@ async def handle_conversation(event, conv_type):
                 val = response.text.strip()
                 set_setting('github_token', '' if val.lower() in ('خالی', 'empty', '-') else val)
                 await conv.send_message('توکن GitHub ذخیره شد.' if get_setting('github_token') else 'توکن پاک شد.')
+            
+            elif conv_type == 'au_set_gh_token':
+                val = (response.text or '').strip()
+                set_setting('auto_gh_token', '' if val.lower() in ('خالی', 'empty', '-') else val)
+                await conv.send_message('✅ توکن GitHub (آپدیت خودکار) ذخیره شد.' if get_setting('auto_gh_token') else 'توکن پاک شد.')
+            elif conv_type == 'au_set_rw_token':
+                val = (response.text or '').strip()
+                set_setting('auto_rw_token', '' if val.lower() in ('خالی', 'empty', '-') else val)
+                await conv.send_message('✅ توکن Railway ذخیره شد.' if get_setting('auto_rw_token') else 'توکن پاک شد.')
+            elif conv_type == 'au_set_gh_owner':
+                set_setting('auto_gh_owner', (response.text or '').strip())
+                await conv.send_message(f"✅ Owner: `{get_setting('auto_gh_owner')}`")
+            elif conv_type == 'au_set_gh_repo':
+                set_setting('auto_gh_repo', (response.text or '').strip())
+                await conv.send_message(f"✅ Repo: `{get_setting('auto_gh_repo')}`")
+            elif conv_type == 'au_set_gh_branch':
+                set_setting('auto_gh_branch', (response.text or '').strip() or 'main')
+                await conv.send_message(f"✅ Branch: `{get_setting('auto_gh_branch')}`")
+            elif conv_type == 'au_set_rw_service':
+                set_setting('auto_rw_service', (response.text or '').strip())
+                await conv.send_message(f"✅ Service ID ذخیره شد.")
+            elif conv_type == 'au_set_rw_env':
+                set_setting('auto_rw_env', (response.text or '').strip())
+                await conv.send_message(f"✅ Environment ID ذخیره شد.")
+            elif conv_type == 'au_upload_zip':
+                if not AUTO_UPDATE_AVAILABLE:
+                    await conv.send_message('❌ ماژول auto_update در دسترس نیست.')
+                else:
+                    zbytes = None
+                    if response.document:
+                        path = await response.download_media(file=bytes)
+                        # telethon may return path or bytes depending version
+                        if isinstance(path, (bytes, bytearray)):
+                            zbytes = bytes(path)
+                        elif isinstance(path, str) and os.path.isfile(path):
+                            with open(path, 'rb') as f:
+                                zbytes = f.read()
+                            try:
+                                os.remove(path)
+                            except Exception:
+                                pass
+                    if not zbytes and response.file:
+                        try:
+                            path = await bot.download_media(response, file=bytes)
+                            if isinstance(path, (bytes, bytearray)):
+                                zbytes = bytes(path)
+                        except Exception as e:
+                            await conv.send_message(f'خطا در دانلود: {e}')
+                    if not zbytes:
+                        await conv.send_message('❌ فایل ZIP معتبر دریافت نشد. یک فایل .zip بفرست.')
+                    else:
+                        token = get_setting('auto_gh_token', '') or get_setting('github_token', '') or os.environ.get('GITHUB_TOKEN', '')
+                        owner = get_setting('auto_gh_owner', '') or get_setting('github_owner', '') or os.environ.get('GITHUB_OWNER', '')
+                        repo = get_setting('auto_gh_repo', '') or get_setting('github_repo', '') or os.environ.get('GITHUB_REPO', '')
+                        branch = get_setting('auto_gh_branch', 'main') or 'main'
+                        if not token or not owner or not repo:
+                            await conv.send_message('❌ ابتدا Token / Owner / Repo را تنظیم کن.')
+                        else:
+                            await conv.send_message('⏳ در حال آپلود سورس به GitHub…')
+                            res = await asyncio.to_thread(
+                                auto_update.upload_source_zip_to_github,
+                                token, owner, repo, zbytes, branch,
+                                f"chore: bot source upload {CURRENT_VERSION}",
+                            )
+                            if res.get('ok'):
+                                files_preview = ', '.join((res.get('files') or [])[:12])
+                                await conv.send_message(
+                                    f"✅ آپلود موفق\n"
+                                    f"📁 فایل‌ها: {res.get('uploaded')} · ⏭ رد: {res.get('skipped')}\n"
+                                    f"`{files_preview}`\n"
+                                    f"ریپو: `{owner}/{repo}@{branch}`\n"
+                                    "اگر Railway به این ریپو وصل باشد، دیپلوی به‌زودی شروع می‌شود.\n"
+                                    "می‌توانی از «چک آپدیت» هم Redeploy بزنی."
+                                )
+                                # refresh remote sha
+                                okc, info = await asyncio.to_thread(auto_update.github_latest_commit, token, owner, repo, branch)
+                                if okc and info.get('sha'):
+                                    set_setting('auto_last_sha', info['sha'])
+                                    set_setting('auto_last_check', _iran_now_str())
+                            else:
+                                errs = '\n'.join((res.get('errors') or ['unknown'])[:5])
+                                await conv.send_message(f"❌ آپلود ناموفق\n{errs}")
+
             elif conv_type == 'set_github_owner':
                 set_setting('github_owner', response.text.strip())
                 await conv.send_message('Owner ذخیره شد: ' + get_setting('github_owner', ''))
@@ -5619,6 +5902,10 @@ async def main():
         scheduler.start()
         logging.info("✅ Scheduler started.")
         try:
+            _rebuild_subscription_pool_from_db()
+        except Exception as _e:
+            logging.warning(f"sub pool rebuild: {_e}")
+        try:
             await reschedule_github_job()
         except Exception as _gh:
             logging.warning(f"github schedule: {_gh}")
@@ -5651,6 +5938,7 @@ MENU_LAYOUTS = {
     'queue_stats_menu': get_queue_stats_layout,
     'nimbaha_menu': get_nimbaha_menu_layout,
     'github_menu': get_github_menu_layout,
+    'auto_update_menu': get_auto_update_menu_layout,
     'sleep_menu': get_sleep_menu_layout,
     'protocol_filter_menu': get_protocol_filter_menu_layout,
     'stats_menu': get_stats_menu_layout,
