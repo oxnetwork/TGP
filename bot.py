@@ -2280,8 +2280,9 @@ def register_bot_handlers():
             text = (
                 "🔍 **نتیجه چک آپدیت**" + chr(10) + chr(10)
                 + f"ریپو: `{owner}/{repo}` @ `{branch}`" + chr(10)
-                + f"Remote SHA: `{remote_sha[:12]}`" + chr(10)
-                + f"Local SHA: `{(local_sha[:12] if local_sha else '—')}`" + chr(10)
+                + f"🏷 آخرین نسخه GitHub: `{_short_sha(remote_sha)}`" + chr(10)
+                + f"📦 نسخه فعلی ذخیره‌شده: `{_short_sha(local_sha)}`" + chr(10)
+                + f"Remote SHA: `{remote_sha[:12] if remote_sha else '—'}`" + chr(10)
                 + f"پیام: {info.get('message') or '—'}" + chr(10)
                 + f"تاریخ: {info.get('date') or '—'}" + chr(10) + chr(10)
                 + ("✅ نسخه جدید روی گیت‌هاب هست." if updated else "ℹ️ همان نسخه قبلی است.")
@@ -2311,7 +2312,7 @@ def register_bot_handlers():
                 await event.respond(
                     "⚠️ Railway Token یا Service ID تنظیم نیست.\n"
                     "اگر ریپو به Railway وصل است، با push قبلی دیپلوی خودکار می‌شود.\n"
-                    "SHA به‌عنوان اعمال‌شده ذخیره می‌شود."
+                    f"🏷 آخرین نسخه ثبت‌شده: `{_short_sha(pending)}`"
                 )
                 if pending:
                     set_setting("auto_last_sha", pending)
@@ -2332,7 +2333,9 @@ def register_bot_handlers():
                         d0 = deps[0]
                         extra = f"\nآخرین دیپلوی: `{d0.get('status')}` · `{d0.get('createdAt')}`"
                 await event.respond(
-                    f"✅ درخواست آپدیت Railway ثبت شد.\nmethod=`{info.get('method')}`{extra}\n"
+                    f"✅ درخواست آپدیت Railway ثبت شد.\n"
+                    f"🏷 آخرین نسخه: `{_short_sha(pending)}`\n"
+                    f"method=`{info.get('method')}`{extra}\n"
                     f"SHA: `{(pending[:12] if pending else '—')}`\n"
                     "بعد از بالا آمدن سرویس، `latest_configs.txt` از دیتابیس بازسازی می‌شود."
                 )
@@ -2485,7 +2488,8 @@ async def get_auto_update_menu_layout():
         + f"🔑 توکن: {'✅' if rw_tok else '❌'}" + chr(10)
         + f"🆔 Service: `{rw_svc or '—'}`" + chr(10)
         + f"🌐 Env: `{rw_env or '—'}`" + chr(10) + chr(10)
-        + f"آخرین SHA ذخیره‌شده: `{last_sha[:12]}`" + chr(10)
+        + f"🏷 آخرین نسخه: `{_short_sha(last_sha)}`" + chr(10)
+        + f"SHA: `{last_sha[:12] if last_sha and last_sha != "-" else "—"}`" + chr(10)
         + f"آخرین چک: {last_check}"
     )
     buttons = [
@@ -3827,19 +3831,24 @@ async def handle_conversation(event, conv_type):
                             )
                             if res.get('ok'):
                                 files_preview = ', '.join((res.get('files') or [])[:12])
+                                # refresh remote sha first so we can show short version
+                                okc, info = await asyncio.to_thread(auto_update.github_latest_commit, token, owner, repo, branch)
+                                full_sha = (info.get('sha') if okc else '') or ''
+                                if full_sha:
+                                    set_setting('auto_last_sha', full_sha)
+                                    set_setting('auto_last_check', _iran_now_str())
+                                short = _short_sha(full_sha)
                                 await conv.send_message(
-                                    f"✅ آپلود موفق\n"
+                                    f"✅ آپلود موفق روی GitHub\n"
+                                    f"🏷 آخرین نسخه (commit): `{short}`\n"
+                                    f"🔗 SHA کامل: `{full_sha or '—'}`\n"
                                     f"📁 فایل‌ها: {res.get('uploaded')} · ⏭ رد: {res.get('skipped')}\n"
                                     f"`{files_preview}`\n"
                                     f"ریپو: `{owner}/{repo}@{branch}`\n"
+                                    f"پیام commit: {(info.get('message') if okc else '—') or '—'}\n\n"
                                     "اگر Railway به این ریپو وصل باشد، دیپلوی به‌زودی شروع می‌شود.\n"
-                                    "می‌توانی از «چک آپدیت» هم Redeploy بزنی."
+                                    "از «چک آپدیت» می‌توانی Redeploy بزنی."
                                 )
-                                # refresh remote sha
-                                okc, info = await asyncio.to_thread(auto_update.github_latest_commit, token, owner, repo, branch)
-                                if okc and info.get('sha'):
-                                    set_setting('auto_last_sha', info['sha'])
-                                    set_setting('auto_last_check', _iran_now_str())
                             else:
                                 errs = '\n'.join((res.get('errors') or ['unknown'])[:5])
                                 await conv.send_message(f"❌ آپلود ناموفق\n{errs}")
@@ -5717,7 +5726,7 @@ async def reschedule_github_job():
 
 
 async def job_daily_summary_report():
-    """Daily summary at 12:00 Asia/Tehran."""
+    """Daily quality report at 12:00 Asia/Tehran for admin."""
     if get_setting('daily_report_enabled', '1') != '1':
         return
     try:
@@ -5727,7 +5736,7 @@ async def job_daily_summary_report():
             "SELECT COUNT(*) FROM successful_configs WHERE timestamp >= ?",
             (today_start,), fetch='one'
         )
-        total_n = total[0] if total else 0
+        total_n = int(total[0] if total else 0)
         by_type = db_execute(
             "SELECT type, COUNT(*) FROM successful_configs WHERE timestamp >= ? GROUP BY type ORDER BY COUNT(*) DESC",
             (today_start,), fetch='all'
@@ -5736,30 +5745,94 @@ async def job_daily_summary_report():
             "SELECT country_code, COUNT(*) FROM successful_configs WHERE timestamp >= ? AND country_code IS NOT NULL GROUP BY country_code ORDER BY COUNT(*) DESC LIMIT 8",
             (today_start,), fetch='all'
         ) or []
+        proxy_n = 0
+        for tname, c in by_type:
+            if str(tname).lower() in ('telegram proxy', 'proxy', 'tgproxy', 'webproxy'):
+                proxy_n += int(c or 0)
+        real_n = max(0, total_n - proxy_n)
+        proxy_pct = (100.0 * proxy_n / total_n) if total_n else 0.0
+
+        rcv = int(pipeline_stats.get('received', 0) or 0)
+        dup = int(pipeline_stats.get('duplicate', 0) or 0)
+        off = int(pipeline_stats.get('offline', 0) or 0)
+        snt = int(pipeline_stats.get('sent', 0) or 0)
+        cblk = int(pipeline_stats.get('country_block', 0) or 0)
+        irn = int(pipeline_stats.get('iran_filter', 0) or 0)
+        oth = int(pipeline_stats.get('other_skip', 0) or 0)
+        denom = max(rcv, 1)
+        dup_pct = 100.0 * dup / denom
+        off_pct = 100.0 * off / denom
+
+        top_src_lines = []
+        for col in ('source', 'source_name', 'channel_title'):
+            try:
+                rows = db_execute(
+                    f"SELECT {col}, COUNT(*) AS c FROM successful_configs WHERE timestamp >= ? GROUP BY {col} ORDER BY c DESC LIMIT 5",
+                    (today_start,), fetch='all'
+                ) or []
+                if rows:
+                    for src, c in rows:
+                        top_src_lines.append(f"• {str(src)[:40]}: {c}")
+                    break
+            except Exception:
+                continue
+
+        try:
+            qsize = file_processing_queue.qsize()
+        except Exception:
+            qsize = -1
+        try:
+            tq = text_link_queue.qsize()
+        except Exception:
+            tq = -1
+
+        try:
+            threshold = int(get_setting('daily_send_warn_threshold', '30') or 30)
+        except Exception:
+            threshold = 30
+        warn = ""
+        if total_n < threshold:
+            warn = f"⚠️ هشدار: ارسال امروز ({total_n}) کمتر از آستانه ({threshold}) است."
+
+        gh_sha = _short_sha(get_setting('auto_last_sha', ''))
         lines = [
-            "📊 گزارش روزانه Phoenix",
-            f"تاریخ: {now.strftime('%Y-%m-%d')}",
+            "📈 گزارش کیفیت روزانه",
+            f"📅 {now.strftime('%Y-%m-%d %H:%M')} IR",
+            f"🏷 نسخه ربات: `{CURRENT_VERSION}` · Git `{gh_sha}`",
             "",
-            f"📦 کانفیگ‌های امروز: {total_n}",
+            f"📤 ارسال امروز (DB): **{total_n}**",
+            f"   ├ کانفیگ: {real_n}",
+            f"   └ پروکسی: {proxy_n} ({proxy_pct:.0f}%)",
+            "",
+            "🔎 قیف از شروع اجرای فعلی:",
+            f"📥 دریافت: {rcv}",
+            f"♻️ تکراری: {dup} ({dup_pct:.0f}%)",
+            f"❌ آفلاین: {off} ({off_pct:.0f}%)",
+            f"🌍 بلاک کشور: {cblk}",
+            f"🇮🇷 فیلتر ایران: {irn}",
+            f"⏭ سایر: {oth}",
+            f"✅ ارسال (session): {snt}",
         ]
         if by_type:
             lines.append("")
-            lines.append("بر اساس پروتکل:")
-            for tname, c in by_type:
+            lines.append("پروتکل‌ها:")
+            for tname, c in by_type[:8]:
                 lines.append(f"• {tname}: {c}")
         if by_country:
             lines.append("")
             lines.append("Top کشورها:")
             for cc, c in by_country:
                 lines.append(f"• {cc}: {c}")
-        try:
-            qsize = file_processing_queue.qsize()
+        if top_src_lines:
             lines.append("")
-            lines.append(f"صف فایل فعلی: {qsize}")
-        except Exception:
-            pass
-        await bot.send_message(ADMIN_USER_ID, "\n".join(lines))
-        logging.info("Daily summary report sent")
+            lines.append("Top منابع:")
+            lines.extend(top_src_lines)
+        lines.append("")
+        lines.append(f"صف متن: {tq} · صف فایل: {qsize}")
+        if warn:
+            lines.append(warn)
+        await bot.send_message(ADMIN_USER_ID, chr(10).join(lines))
+        logging.info("Daily quality report sent")
     except Exception as e:
         logging.error(f"Daily summary failed: {e}")
 
