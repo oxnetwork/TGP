@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -255,3 +256,159 @@ def railway_redeploy(token: str, service_id: str, environment_id: str = "") -> T
                 return True, {"result": data2, "method": "deploymentRestart", "deploymentId": dep_id}
             return False, {"error": data2.get("error") or data2, "prev": err1}
     return False, err1 if isinstance(err1, dict) else {"error": str(err1)}
+
+
+def detect_version_from_bytes(data: bytes) -> str:
+    """Best-effort parse CURRENT_VERSION / vX.Y from bot.py content."""
+    try:
+        text = data.decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'Phoenix(?: Edition)?\s*[-–]?\s*v?(\d+\.\d+)', text, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r'\bv(\d+\.\d+)\b', text)
+    return m.group(1) if m else ""
+
+
+def detect_version_from_zip(zip_bytes: bytes) -> str:
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except Exception:
+        return ""
+    names = zf.namelist()
+    candidates = [n for n in names if n.replace("\\", "/").endswith("bot.py")]
+    # prefer shortest path bot.py
+    candidates.sort(key=lambda n: (n.count("/"), len(n)))
+    for n in candidates:
+        try:
+            ver = detect_version_from_bytes(zf.read(n))
+            if ver:
+                return ver
+        except Exception:
+            continue
+    return ""
+
+
+def _zip_prefix(names):
+    tops = set()
+    for n in names:
+        if n.endswith("/"):
+            continue
+        tops.add(n.split("/")[0] if "/" in n else "")
+    prefix = ""
+    if len(tops) == 1:
+        only = next(iter(tops))
+        if only and all(n.startswith(only + "/") or n == only for n in names if not n.endswith("/")):
+            prefix = only + "/"
+    return prefix
+
+
+def apply_source_zip_locally(zip_bytes: bytes, app_dir: str = "/app") -> dict:
+    """
+    Extract source files from zip into app_dir (overwrite).
+    This is the critical step so Railway/GitHub are not the only path to update.
+    """
+    import re as _re
+    result = {"ok": False, "written": 0, "skipped": 0, "errors": [], "files": [], "version": "", "app_dir": app_dir}
+    skip_parts = (".git/", "__pycache__/", ".venv/", "venv/", "node_modules/")
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except Exception as e:
+        result["errors"].append(f"invalid zip: {e}")
+        return result
+
+    names = zf.namelist()
+    prefix = _zip_prefix(names)
+    os.makedirs(app_dir, exist_ok=True)
+    written = []
+    for name in names:
+        if name.endswith("/"):
+            continue
+        rel = name[len(prefix):] if prefix and name.startswith(prefix) else name
+        rel = rel.lstrip("/").replace("\\", "/")
+        if not rel or ".." in rel.split("/"):
+            continue
+        low = rel.lower()
+        if any(s in low for s in skip_parts):
+            result["skipped"] += 1
+            continue
+        # only ship source-ish files
+        if not (low.endswith((".py", ".txt", ".md", ".sh", ".toml", ".yml", ".yaml", ".json", ".cfg", ".ini"))):
+            result["skipped"] += 1
+            continue
+        try:
+            data = zf.read(name)
+        except Exception as e:
+            result["errors"].append(f"{rel}: {e}")
+            continue
+        if len(data) > 5_000_000:
+            result["skipped"] += 1
+            continue
+        dest = os.path.join(app_dir, rel)
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            with open(dest, "wb") as f:
+                f.write(data)
+            written.append(rel)
+            result["written"] += 1
+            if rel.endswith("bot.py") or rel == "bot.py":
+                result["version"] = detect_version_from_bytes(data) or result["version"]
+        except Exception as e:
+            result["errors"].append(f"{rel}: write {e}")
+
+    result["files"] = written[:40]
+    result["ok"] = result["written"] > 0
+    if not result["version"]:
+        result["version"] = detect_version_from_zip(zip_bytes)
+    return result
+
+
+def full_update_from_zip(
+    zip_bytes: bytes,
+    *,
+    token: str = "",
+    owner: str = "",
+    repo: str = "",
+    branch: str = "main",
+    app_dir: str = "/app",
+    push_github: bool = True,
+) -> dict:
+    """Apply zip locally first, then optionally push to GitHub."""
+    out = {
+        "ok": False,
+        "local": {},
+        "github": {},
+        "version": "",
+        "errors": [],
+    }
+    local = apply_source_zip_locally(zip_bytes, app_dir=app_dir)
+    out["local"] = local
+    out["version"] = local.get("version") or detect_version_from_zip(zip_bytes) or ""
+    if not local.get("ok"):
+        out["errors"].append("local apply failed")
+        out["errors"].extend(local.get("errors") or [])
+        return out
+
+    if push_github and token and owner and repo:
+        ver = out["version"] or "update"
+        msg = f"chore: bot source upload {ver}"
+        gh = upload_source_zip_to_github(
+            token, owner, repo, zip_bytes, branch=branch, commit_message=msg
+        )
+        out["github"] = gh
+        if not gh.get("ok"):
+            out["errors"].append("github upload failed")
+            out["errors"].extend(gh.get("errors") or [])
+            # local ok still counts as partial success
+            out["ok"] = True
+            out["partial"] = True
+            return out
+    out["ok"] = True
+    return out
+
