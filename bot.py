@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # ---------------------------------------------------------------------------
-# V2Ray & Proxy Extractor Bot (Phoenix Edition - v9.12 - File Processor)
+# V2Ray & Proxy Extractor Bot (Phoenix Edition - v9.16 - FileHash/SmartCap/SourcesBackup)
 # Author: Gemini (Modified by user request)
 # Description: Version 9.12 adds a robust system for processing .txt files
 #              from dedicated source channels, complete with a processing queue
@@ -511,19 +511,7 @@ def _refresh_latest_proxies_file():
 
 
 CUSTOM_FONT_FILE = 'arial.ttf'
-CURRENT_VERSION = "9.15"
-
-def _short_sha(sha, n=7):
-    """Short git SHA for UI (e.g. 3cfb07f)."""
-    try:
-        s = (sha or "").strip()
-        if not s or s == "-":
-            return "—"
-        return s[: int(n)]
-    except Exception:
-        return "—"
-
-
+CURRENT_VERSION = "9.13"
 SUPPORTED_PROTOCOLS = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'wireguard', 'telegram proxy']
 PROTOCOL_NAMES = {
     'vless': 'VLESS', 'vmess': 'VMess', 'trojan': 'Trojan',
@@ -1930,6 +1918,64 @@ def register_bot_handlers():
         elif data.startswith('del_txt_src_'):
             db_execute("DELETE FROM source_txt_channels WHERE channel_id = ?", (int(data.split('_')[-1]),))
             await edit_panel(get_remove_txt_sources_layout, 1, "✅ منبع TXT حذف شد.")
+        
+        elif data == 'export_sources_txt':
+            try:
+                await event.answer()
+            except Exception:
+                pass
+            try:
+                lines = []
+                lines.append('# Phoenix sources backup')
+                lines.append('# generated: ' + time.strftime('%Y-%m-%d %H:%M:%S'))
+                lines.append('')
+                lines.append('## TEXT_SOURCES')
+                rows = db_execute(
+                    "SELECT channel_id, title FROM source_channels ORDER BY title COLLATE NOCASE",
+                    fetch='all',
+                ) or []
+                for cid, title in rows:
+                    lines.append(f"{cid}\t{title or ''}")
+                lines.append('')
+                lines.append('## FILE_SOURCES')
+                rows = db_execute(
+                    "SELECT channel_id, title FROM source_txt_channels ORDER BY title COLLATE NOCASE",
+                    fetch='all',
+                ) or []
+                for cid, title in rows:
+                    lines.append(f"{cid}\t{title or ''}")
+                lines.append('')
+                lines.append('## SUB_SOURCES')
+                try:
+                    rows = db_execute(
+                        "SELECT url, enabled FROM sub_sources",
+                        fetch='all',
+                    ) or []
+                    for url, en in rows:
+                        lines.append(f"{url}\t{en}")
+                except Exception:
+                    pass
+                content = "\n".join(lines) + "\n"
+                _dd = os.environ.get('DATA_DIR') or os.environ.get('DB_FILE', '/data/bot_data.db')
+                if str(_dd).endswith('.db'):
+                    _dd = os.path.dirname(_dd) or '/data'
+                path = os.path.join(_dd, 'sources_backup.txt')
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                n_text = len(db_execute('SELECT channel_id FROM source_channels', fetch='all') or [])
+                n_file = len(db_execute('SELECT channel_id FROM source_txt_channels', fetch='all') or [])
+                await bot.send_file(
+                    event.sender_id,
+                    path,
+                    caption=f"📤 بکاپ منابع\nمتنی: {n_text}\nفایلی: {n_file}",
+                )
+            except Exception as e:
+                logging.error(f"export_sources_txt: {e}")
+                try:
+                    await event.reply(f"❌ خطا در بکاپ منابع: {e}")
+                except Exception:
+                    pass
+
         elif data == 'export_full_backup':
             if os.path.exists(DB_FILE):
                 await bot.send_file(event.chat_id, DB_FILE, caption="📄 فایل پشتیبان پایگاه داده")
@@ -2080,6 +2126,12 @@ def register_bot_handlers():
         elif data == 'npvt_cap_inc':
             n = min(50, int(get_setting('npvt_source_hourly_limit', '8') or 8) + 1)
             set_setting('npvt_source_hourly_limit', str(n))
+        elif data == 'npvt_hash_cd_plus':
+            n = min(720, int(get_setting('npvt_file_hash_cooldown_min', '90') or 90) + 15)
+            set_setting('npvt_file_hash_cooldown_min', str(n))
+        elif data == 'npvt_hash_cd_minus':
+            n = max(0, int(get_setting('npvt_file_hash_cooldown_min', '90') or 90) - 15)
+            set_setting('npvt_file_hash_cooldown_min', str(n))
             await edit_panel(get_priority_queue_menu_layout)
         elif data == 'npvt_cap_dec':
             n = max(0, int(get_setting('npvt_source_hourly_limit', '8') or 8) - 1)
@@ -2658,6 +2710,7 @@ async def get_sources_menu_layout():
         [Button.inline(get_text('button_text_sources', 'fa'), "text_sources_menu")],
         [Button.inline(get_text('button_file_sources', 'fa'), "file_sources_menu")],
         [Button.inline("🔗 منابع سابسکریپشن", "sub_sources_menu")],
+        [Button.inline("📤 بکاپ منابع (TXT)", "export_sources_txt")],
         [Button.inline(get_text('button_back_main', 'fa'), "main_menu")]
     ]
     return text, buttons
@@ -4068,29 +4121,37 @@ async def process_message_from_channel(message):
                     channel_name = getattr(ch, "title", str(chat_id))
                 except Exception:
                     channel_name = str(chat_id)
-                # per-source hourly rate limit for NPVT
+                # file-hash cooldown + smart per-source hourly rate limit
                 try:
-                    cap = int(get_setting('npvt_source_hourly_limit', '8') or 0)
+                    base_cap = int(get_setting('npvt_source_hourly_limit', '8') or 0)
                 except Exception:
-                    cap = 8
-                if cap > 0:
-                    import time as _t
-                    key = f"npvt_rate_{chat_id}"
-                    raw = get_setting(key, '') or ''
-                    now = int(_t.time())
-                    stamps = []
-                    for p in raw.split(','):
-                        p = p.strip()
-                        if p.isdigit() and now - int(p) < 3600:
-                            stamps.append(int(p))
-                    if len(stamps) >= cap:
-                        logging.info(f"⏳ NPVT rate-limit source {chat_id} ({len(stamps)}/{cap}/h) skip {fname}")
+                    base_cap = 8
+                try:
+                    cooldown_min = int(get_setting('npvt_file_hash_cooldown_min', '90') or 90)
+                except Exception:
+                    cooldown_min = 90
+                try:
+                    import quality_modules as qm
+                    allowed_hash, fhash = qm.file_hash_allowed(file_bytes, max(0, cooldown_min) * 60)
+                    if not allowed_hash:
+                        logging.info(
+                            f"⏳ NPVT file-hash cooldown skip {fname} sha={fhash[:12]} ({cooldown_min}m)"
+                        )
                     else:
-                        stamps.append(now)
-                        set_setting(key, ','.join(str(s) for s in stamps[-cap:]))
-                        await file_processing_queue.put(("npvt_bytes", file_bytes, fname, channel_name, chat_id))
-                        logging.info(f"📦 Queued NPVT '{fname}' ({len(file_bytes)} bytes).")
-                else:
+                        cap = qm.smart_source_cap(str(chat_id), base_cap) if base_cap > 0 else 0
+                        if base_cap > 0 and not qm.source_npvt_allowed(str(chat_id), cap):
+                            logging.info(
+                                f"⏳ NPVT rate-limit source {chat_id} "
+                                f"({qm.source_npvt_count(str(chat_id))}/{cap}/h smart base={base_cap}) skip {fname}"
+                            )
+                        else:
+                            if base_cap > 0:
+                                qm.source_npvt_record(str(chat_id))
+                            qm.file_hash_record(fhash)
+                            await file_processing_queue.put(("npvt_bytes", file_bytes, fname, channel_name, chat_id))
+                            logging.info(f"📦 Queued NPVT '{fname}' ({len(file_bytes)} bytes).")
+                except Exception as _qe:
+                    logging.warning(f"NPVT quality gate fallback: {_qe}")
                     await file_processing_queue.put(("npvt_bytes", file_bytes, fname, channel_name, chat_id))
                     logging.info(f"📦 Queued NPVT '{fname}' ({len(file_bytes)} bytes).")
             except Exception as e:
@@ -4115,7 +4176,7 @@ async def file_processing_worker(worker_id: int = 1):
             if ftype == "npvt_bytes":
                 _, file_bytes, fname, channel_name, chat_id = item
                 logging.info(f"▶️ [W{worker_id}] NPVT '{fname}' ({len(file_bytes)} B) q={file_processing_queue.qsize()}")
-                await process_npvt_bytes(file_bytes, fname, channel_name, admin_test=False)
+                await process_npvt_bytes(file_bytes, fname, channel_name, admin_test=False, source_id=chat_id)
             elif ftype == "npvt":
                 message = item[1] if len(item) > 1 else None
                 if message is None or not getattr(message, "media", None):
@@ -4342,7 +4403,7 @@ async def process_npvt_file_from_channel(message, admin_test: bool = False):
     await process_npvt_bytes(file_bytes, file_name, channel_name, admin_test=admin_test)
 
 
-async def process_npvt_bytes(file_bytes: bytes, file_name: str, channel_name: str, admin_test: bool = False):
+async def process_npvt_bytes(file_bytes: bytes, file_name: str, channel_name: str, admin_test: bool = False, source_id=None):
     """Decrypt NPVT bytes, extract V2Ray URIs, process through pipeline."""
     if not NPVT_AVAILABLE or decrypt_npvt is None:
         logging.warning("⚠️ NPVT module not available.")
@@ -4516,6 +4577,12 @@ async def process_npvt_bytes(file_bytes: bytes, file_name: str, channel_name: st
             f"♻️ Skipped (dup): `{skipped_count}`"
         )
         logging.info(summary.replace("**", "").replace("`", ""))
+        try:
+            import quality_modules as qm
+            _sid = source_id if source_id is not None else channel_name
+            qm.record_source_outcome(str(_sid), sent_count, skipped_count, offline_count)
+        except Exception:
+            pass
         if progress_msg:
             await bot.edit_message(progress_msg, summary)
 
