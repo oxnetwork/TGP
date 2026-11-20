@@ -511,7 +511,7 @@ def _refresh_latest_proxies_file():
 
 
 CUSTOM_FONT_FILE = 'arial.ttf'
-CURRENT_VERSION = "9.13"
+CURRENT_VERSION = "9.16"
 SUPPORTED_PROTOCOLS = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'wireguard', 'telegram proxy']
 PROTOCOL_NAMES = {
     'vless': 'VLESS', 'vmess': 'VMess', 'trojan': 'Trojan',
@@ -2570,7 +2570,7 @@ async def get_auto_update_menu_layout():
         [Button.inline("👤 Owner", "au_set_gh_owner"), Button.inline("📁 Repo", "au_set_gh_repo")],
         [Button.inline("🌿 Branch", "au_set_gh_branch")],
         [Button.inline("🆔 Service ID", "au_set_rw_service"), Button.inline("🌐 Env ID", "au_set_rw_env")],
-        [Button.inline("📦 آپلود سورس (ZIP)", "au_upload_zip")],
+        [Button.inline("📦 آپلود و اعمال ZIP", "au_upload_zip")],
         [Button.inline("🔍 چک آپدیت", "au_check_update")],
         [Button.inline("♻️ Rebuild latest_configs", "au_rebuild_sub")],
         [Button.inline("🔙 بازگشت", "system_menu")],
@@ -3580,7 +3580,7 @@ async def handle_conversation(event, conv_type):
         'au_set_gh_branch': 'نام برنچ را بفرست (مثال: main)',
         'au_set_rw_service': 'Railway Service ID را بفرست',
         'au_set_rw_env': 'Railway Environment ID را بفرست (اختیاری)',
-        'au_upload_zip': 'فایل ZIP سورس را ارسال کن',
+        'au_upload_zip': 'فایل ZIP سورس را بفرست.\nاول روی سرور اعمال می‌شود، بعد GitHub، بعد Redeploy.',
         'add_source': "لطفا یوزرنیم، لینک یا یک پیام فوروارد شده از کانال منبع متنی را ارسال کنید.",
         'add_sub_source': "لینک سابسکریپشن را بفرستید (مثال: https://raw.githubusercontent.com/.../all.txt).",
         'add_txt_source': "لطفا یوزرنیم، لینک یا یک پیام فوروارد شده از کانال منبع فایل TXT را ارسال کنید.",
@@ -3870,7 +3870,6 @@ async def handle_conversation(event, conv_type):
                     zbytes = None
                     if response.document:
                         path = await response.download_media(file=bytes)
-                        # telethon may return path or bytes depending version
                         if isinstance(path, (bytes, bytearray)):
                             zbytes = bytes(path)
                         elif isinstance(path, str) and os.path.isfile(path):
@@ -3894,38 +3893,80 @@ async def handle_conversation(event, conv_type):
                         owner = get_setting('auto_gh_owner', '') or get_setting('github_owner', '') or os.environ.get('GITHUB_OWNER', '')
                         repo = get_setting('auto_gh_repo', '') or get_setting('github_repo', '') or os.environ.get('GITHUB_REPO', '')
                         branch = get_setting('auto_gh_branch', 'main') or 'main'
-                        if not token or not owner or not repo:
-                            await conv.send_message('❌ ابتدا Token / Owner / Repo را تنظیم کن.')
+                        app_dir = os.environ.get('APP_DIR') or ('/app' if os.path.isdir('/app') else os.getcwd())
+                        await conv.send_message('⏳ مرحله ۱/۳: اعمال ZIP روی سرور…')
+                        res = await asyncio.to_thread(
+                            auto_update.full_update_from_zip,
+                            zbytes,
+                            token=token,
+                            owner=owner,
+                            repo=repo,
+                            branch=branch,
+                            app_dir=app_dir,
+                            push_github=bool(token and owner and repo),
+                        )
+                        local = res.get('local') or {}
+                        gh = res.get('github') or {}
+                        ver = res.get('version') or ''
+                        if ver:
+                            try:
+                                set_setting('auto_reported_version', ver)
+                            except Exception:
+                                pass
+                        lines = []
+                        if local.get('ok'):
+                            lines.append(f"✅ اعمال محلی: `{local.get('written')}` فایل → `{app_dir}`")
+                            if ver:
+                                lines.append(f"🏷 نسخه داخل ZIP: `{ver}`")
+                            prev = ', '.join((local.get('files') or [])[:10])
+                            if prev:
+                                lines.append(f"فایل‌ها: `{prev}`")
                         else:
-                            await conv.send_message('⏳ در حال آپلود سورس به GitHub…')
-                            res = await asyncio.to_thread(
-                                auto_update.upload_source_zip_to_github,
-                                token, owner, repo, zbytes, branch,
-                                f"chore: bot source upload {CURRENT_VERSION}",
-                            )
-                            if res.get('ok'):
-                                files_preview = ', '.join((res.get('files') or [])[:12])
-                                # refresh remote sha first so we can show short version
+                            lines.append('❌ اعمال محلی ناموفق')
+                            lines.extend((local.get('errors') or ['unknown'])[:5])
+                        if token and owner and repo:
+                            if gh.get('ok'):
                                 okc, info = await asyncio.to_thread(auto_update.github_latest_commit, token, owner, repo, branch)
                                 full_sha = (info.get('sha') if okc else '') or ''
                                 if full_sha:
                                     set_setting('auto_last_sha', full_sha)
                                     set_setting('auto_last_check', _iran_now_str())
                                 short = _short_sha(full_sha)
-                                await conv.send_message(
-                                    f"✅ آپلود موفق روی GitHub\n"
-                                    f"🏷 آخرین نسخه (commit): `{short}`\n"
-                                    f"🔗 SHA کامل: `{full_sha or '—'}`\n"
-                                    f"📁 فایل‌ها: {res.get('uploaded')} · ⏭ رد: {res.get('skipped')}\n"
-                                    f"`{files_preview}`\n"
-                                    f"ریپو: `{owner}/{repo}@{branch}`\n"
-                                    f"پیام commit: {(info.get('message') if okc else '—') or '—'}\n\n"
-                                    "اگر Railway به این ریپو وصل باشد، دیپلوی به‌زودی شروع می‌شود.\n"
-                                    "از «چک آپدیت» می‌توانی Redeploy بزنی."
-                                )
+                                lines.append(f"✅ GitHub: `{owner}/{repo}@{branch}` · `{short}`")
+                                lines.append(f"پیام: `{(info.get('message') if okc else '') or ('upload '+ver)}`")
                             else:
-                                errs = '\n'.join((res.get('errors') or ['unknown'])[:5])
-                                await conv.send_message(f"❌ آپلود ناموفق\n{errs}")
+                                lines.append('⚠️ GitHub آپلود نشد (محلی انجام شد)')
+                                if gh.get('errors'):
+                                    lines.append('· ' + ' | '.join(gh.get('errors')[:3]))
+                        else:
+                            lines.append('ℹ️ Token/Repo نیست → فقط اعمال محلی انجام شد')
+
+                        # Railway redeploy (always try after successful local apply)
+                        rw = get_setting('auto_rw_token', '') or os.environ.get('RAILWAY_TOKEN', '')
+                        svc = get_setting('auto_rw_service', '') or os.environ.get('RAILWAY_SERVICE_ID', '')
+                        env = get_setting('auto_rw_env', '') or os.environ.get('RAILWAY_ENVIRONMENT_ID', '')
+                        if local.get('ok') and rw and svc:
+                            await conv.send_message('⏳ مرحله ۲/۳: Redeploy Railway…')
+                            ok_rw, info_rw = await asyncio.to_thread(auto_update.railway_redeploy, rw, svc, env)
+                            if ok_rw:
+                                lines.append(f"✅ Railway Redeploy ثبت شد (`{info_rw.get('method')}`)")
+                            else:
+                                lines.append(f"⚠️ Redeploy: `{info_rw.get('error') or info_rw}`")
+                        elif local.get('ok'):
+                            lines.append('ℹ️ Railway Token/Service نیست → Redeploy دستی بزن')
+
+                        await conv.send_message('\n'.join(lines))
+                        if local.get('ok'):
+                            await conv.send_message(
+                                '⏳ مرحله ۳/۳: ریستارت پروسس…\n'
+                                'اگر تا ۳۰ثانیه برنگشت، از پنل Railway یک بار Redeploy بزن.'
+                            )
+                            # hard restart so new code loads
+                            try:
+                                await asyncio.sleep(1.2)
+                                os._exit(0)
+                            except Exception:
+                                pass
 
             elif conv_type == 'set_github_owner':
                 set_setting('github_owner', response.text.strip())
